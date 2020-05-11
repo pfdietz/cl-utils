@@ -17,7 +17,7 @@
         :iterate
         :named-readtables
         :curry-compose-reader-macros)
-  (:import-from :serapeum :mapconcat :drop-while :take-while :plist-keys)
+  (:import-from :serapeum :mapconcat :drop-while :take-while :plist-keys :tuple)
   (:import-from :uiop/utility :with-muffled-conditions)
   (:import-from :uiop/image :quit :*lisp-interaction*)
   #+sbcl
@@ -85,6 +85,8 @@
            ;; hash tables
            :make-thread-safe-hash-table
            :random-hash-table-key
+           ;; loop unrolling
+           :unroll
            ;; lisp image
            :quit
            :*lisp-interaction*))
@@ -597,3 +599,58 @@ not work on circular lists."
   (let ((size (hash-table-count hash-tbl)))
     (unless (zerop size)
       (find-hash-table-element hash-tbl (random size)))))
+
+;;; Loop unrolling macro
+(defparameter +max-unroll+ 100)
+
+(defmacro let-tagbody (bindings &body body)
+  "Like (LET bindings (TAGBODY . body), except the declarations
+of body are placed outside the tagbody."
+  (let ((declarations
+         (loop while (and (consp body)
+                          (consp (car body))
+                          (eql (caar body) 'declare))
+            collect (pop body))))
+    `(let ,bindings ,@declarations (tagbody ,@body))))
+
+(defun unroll-dolist (form &key (max +max-unroll+))
+  (assert (symbolp (car form)) () "Not a symbol: ~a" (car form))
+  (destructuring-bind ((var list &optional return-value) &rest body)
+      (cdr form)
+    (if (and (typep list '(tuple (eql 'quote) list))
+             (<= (length (cadr list)) max))
+        `(block nil
+           ,@(loop for val in (cadr list)
+                collect `(let-tagbody ((,var ',val))
+                                      ,@body))
+           (let ((,var nil)) (declare (ignorable ,var)) ,return-value))
+        form)))
+
+(defun unroll-dotimes (form &key (max +max-unroll+))
+  (destructuring-bind ((var count &optional return-value) &rest body)
+      (cdr form)
+    (if (and (symbolp var) (integerp count) (<= count max))
+        (let ((count (max 0 count)))
+          `(block nil
+             ,@(loop for i from 0 below count
+                  collect `(let-tagbody ((,var ,i)) ,@body))
+             (let ((,var ,count)) (declare (ignorable ,var)) ,return-value)))
+        form)))
+
+(defun unroll-mapcar (form &key (max +max-unroll+))
+  (destructuring-bind (fn list)
+      (cdr form)
+    (if (and (typep list '(tuple (eql quote) list))
+             (<= (length (cadr list)) max))
+        `(list ,@(loop for val in (cadr list)
+                    collect `(funcall ,fn ',val)))
+        form)))
+
+(defmacro unroll (form &key (max +max-unroll+))
+  (if (consp form)
+      (case (car form)
+        ((dolist) (unroll-dolist form :max max))
+        ((dotimes) (unroll-dotimes form :max max))
+        ((mapcar) (unroll-mapcar form :max max))
+        (t form))
+      form))
